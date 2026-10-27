@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(not SUPPORTED, reason="native overwrite metadata
 def renderer(monkeypatch):
     servers = []
 
-    def start(during_request=lambda: None):
+    def start(during_request=lambda: None, declared_length=None):
         calls = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -28,9 +28,10 @@ def renderer(monkeypatch):
                 during_request()
                 data = b"<svg>new render</svg>"
                 self.send_response(200)
-                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Length", str(len(data) if declared_length is None else declared_length))
                 self.end_headers()
                 self.wfile.write(data)
+                self.close_connection = True
 
             def log_message(self, *args):
                 pass
@@ -387,3 +388,84 @@ def test_linux_content_integrity_metadata_is_not_rebound_to_render_bytes(monkeyp
     mermaid_backend._preserve_destination_metadata(str(source), str(staged), source.stat())
     assert attributes[str(staged)] == ordinary
     assert attributes[str(source)] == dict(content_bound, **ordinary)
+
+
+@pytest.mark.parametrize("suffix", ["/", "/.", "/..", "/./."])
+@pytest.mark.parametrize("links", [0, 1, 2])
+def test_directory_shaped_outputs_are_rejected_before_normalizing(renderer, tmp_path, suffix, links):
+    missing = tmp_path / "missing"
+    output = str(missing) + suffix
+    for index in range(links):
+        link = tmp_path / f"link-{index}.svg"
+        link.symlink_to(output)
+        output = str(link)
+    calls = renderer()
+    with pytest.raises(RuntimeError, match="directory"):
+        mermaid_backend.render_to_file("pako:x", output, "svg")
+    assert not calls
+    assert not missing.exists()
+    assert not list(tmp_path.glob(".mermaid-*"))
+    for index in range(links):
+        assert (tmp_path / f"link-{index}.svg").is_symlink()
+
+
+def test_parent_directory_link_with_dot_target_still_allows_output(renderer, tmp_path):
+    directory = tmp_path / "artifacts"
+    directory.mkdir()
+    link = tmp_path / "parent"
+    link.symlink_to(str(directory) + "/.")
+    calls = renderer()
+    mermaid_backend.render_to_file("pako:x", str(link / "output.svg"), "svg")
+    assert calls
+    assert (directory / "output.svg").read_bytes() == b"<svg>new render</svg>"
+    assert link.is_symlink()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_truncated_http_response_is_a_clean_cli_error(renderer, tmp_path, existing):
+    from click.testing import CliRunner
+    from cli_anything.mermaid.mermaid_cli import cli
+
+    output = tmp_path / "output.svg"
+    if existing:
+        output.write_bytes(b"original")
+    project = tmp_path / "project.json"
+    runner = CliRunner()
+    created = runner.invoke(cli, ["project", "new", "-o", str(project)])
+    assert created.exit_code == 0, created.output
+    calls = renderer(declared_length=1000)
+    result = runner.invoke(cli, ["--project", str(project), "export", "render", str(output), "--overwrite"])
+    assert calls
+    assert result.exit_code == 1
+    assert "Error:" in result.output
+    assert "renderer" in result.output.lower()
+    assert "Traceback" not in result.output
+    if existing:
+        assert output.read_bytes() == b"original"
+    else:
+        assert not output.exists()
+    assert not list(tmp_path.glob(".mermaid-*"))
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_successful_publication_releases_staging_name_ownership(monkeypatch, renderer, tmp_path, existing):
+    target = tmp_path / "output.svg"
+    if existing:
+        target.write_bytes(b"original")
+    real_replace = os.replace
+    unrelated = []
+
+    def publish_then_reuse_name(source, destination):
+        real_replace(source, destination)
+        # Another process can now exclusively create this vacated name.
+        with open(source, "xb") as fh:
+            fh.write(b"another writer")
+        unrelated.append(source)
+
+    monkeypatch.setattr(os, "replace", publish_then_reuse_name)
+    renderer()
+    mermaid_backend.render_to_file("pako:x", str(target), "svg")
+    assert target.read_bytes() == b"<svg>new render</svg>"
+    assert len(unrelated) == 1
+    with open(unrelated[0], "rb") as fh:
+        assert fh.read() == b"another writer"

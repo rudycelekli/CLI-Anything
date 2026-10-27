@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import http.client
 import json
 import os
 import secrets
@@ -38,6 +39,25 @@ def build_live_url(serialized: str, mode: str) -> str:
         raise ValueError(f"Unsupported share mode: {mode}")
     return f"{LIVE_BASE}/{mode}#{serialized}"
 
+
+
+def _validate_output_path_shape(path: str) -> None:
+    """Reject directory syntax before realpath can erase it, also through links."""
+    seen = set()
+    while True:
+        normalized_separators = path.replace(os.altsep, os.sep) if os.altsep else path
+        if normalized_separators.split(os.sep)[-1] in {"", ".", ".."}:
+            raise OSError("Output path denotes a directory")
+        # Only follow the terminal entry: a parent link to "directory/." is
+        # valid when the caller still names a file underneath that directory.
+        path = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+        if not os.path.islink(path):
+            return
+        if path in seen:
+            raise OSError("Output path contains a symlink loop")
+        seen.add(path)
+        target = os.readlink(path)
+        path = target if os.path.isabs(target) else os.path.join(os.path.dirname(path), target)
 
 
 def _capture_output_links(path: str) -> dict[str, tuple]:
@@ -213,6 +233,7 @@ def render_to_file(serialized: str, output_path: str, fmt: str) -> dict:
         raise RuntimeError(f"Could not write {output_path}: output path denotes a directory")
     try:
         requested_path = output_path if os.path.isabs(output_path) else os.path.join(os.getcwd(), output_path)
+        _validate_output_path_shape(requested_path)
         destination_path = os.path.realpath(requested_path)
         output_links = _capture_output_links(requested_path)
         _revalidate_output_path(requested_path, destination_path, output_links)
@@ -231,6 +252,8 @@ def render_to_file(serialized: str, output_path: str, fmt: str) -> dict:
             f"Renderer returned HTTP {exc.code} for {fmt} output "
             "(check the diagram syntax)"
         ) from exc
+    except http.client.HTTPException as exc:
+        raise RuntimeError(f"Could not read renderer response: {exc}") from exc
     except (urllib.error.URLError, OSError) as exc:
         raise RuntimeError(f"Could not reach renderer {RENDER_BASE}: {exc}") from exc
     temporary_path = None
@@ -267,6 +290,7 @@ def render_to_file(serialized: str, output_path: str, fmt: str) -> dict:
             raise OSError("Output destination metadata changed while staging")
         _revalidate_output_path(requested_path, destination_path, output_links)
         os.replace(temporary_path, destination_path)
+        temporary_path = None  # Publication releases ownership of the staging name.
     except OSError as exc:
         raise RuntimeError(f"Could not write {output_path}: {exc}") from exc
     finally:
