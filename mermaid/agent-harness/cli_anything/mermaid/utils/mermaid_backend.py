@@ -74,6 +74,11 @@ def _capture_output_links(path: str) -> dict[str, tuple]:
         for component in tail.split(os.sep):
             if not component:
                 continue
+            if component in {".", ".."}:
+                # A lexical collapse must not erase a missing/non-directory
+                # traversal component, including in a dangling link target.
+                if not stat.S_ISDIR(os.stat(cursor).st_mode):
+                    raise OSError("Output traversal component is not a directory")
             cursor = os.path.join(cursor, component)
             try:
                 entry = os.lstat(cursor)
@@ -138,37 +143,37 @@ def _metadata_version(value: os.stat_result) -> tuple:
     return (value.st_mode, value.st_uid, value.st_gid, value.st_mtime_ns, value.st_ctime_ns)
 
 
-def _set_macos_acl(source: str | None, staged: str) -> None:
+def _set_macos_acl(source: int | None, staged: int) -> None:
     """Copy the exact ACL, or install an empty ACL for private staging."""
     import ctypes
     native = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
     native.acl_init.argtypes = [ctypes.c_int]
     native.acl_init.restype = ctypes.c_void_p
-    native.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
-    native.acl_get_file.restype = ctypes.c_void_p
-    native.acl_set_file.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
-    native.acl_set_file.restype = ctypes.c_int
+    native.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    native.acl_get_fd_np.restype = ctypes.c_void_p
+    native.acl_set_fd_np.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    native.acl_set_fd_np.restype = ctypes.c_int
     native.acl_free.argtypes = [ctypes.c_void_p]
     native.acl_free.restype = ctypes.c_int
     # sys/acl.h: ACL_TYPE_EXTENDED = 0x00000100.
-    acl = native.acl_get_file(os.fsencode(source), 0x100) if source is not None else native.acl_init(0)
+    acl = native.acl_get_fd_np(source, 0x100) if source is not None else native.acl_init(0)
     if not acl and source is not None and ctypes.get_errno() == errno.ENOENT:
         # macOS also returns ENOENT for an existing file with no extended ACL.
         # Require the entry to exist; the caller revalidates its identity later.
-        os.lstat(source)
+        os.fstat(source)
         acl = native.acl_init(0)
     if not acl:
         number = ctypes.get_errno()
         raise OSError(number, os.strerror(number))
     try:
-        if native.acl_set_file(os.fsencode(staged), 0x100, acl) != 0:
+        if native.acl_set_fd_np(staged, acl, 0x100) != 0:
             number = ctypes.get_errno()
             raise OSError(number, os.strerror(number))
     finally:
         native.acl_free(acl)
 
 
-def _make_staging_private(path: str) -> None:
+def _make_staging_private(path: int) -> None:
     """Remove inherited reader ACLs before any overwrite content is written."""
     if sys.platform == "darwin":
         _set_macos_acl(None, path)
@@ -180,9 +185,9 @@ def _make_staging_private(path: str) -> None:
     os.chmod(path, 0o600)
 
 
-def _preserve_destination_metadata(source: str, staged: str, original: os.stat_result) -> None:
+def _preserve_destination_metadata(source: str, staged: int, original: os.stat_result) -> None:
     """Keep ordinary access controls, excluding executable-content privileges."""
-    current = os.stat(staged)
+    current = os.fstat(staged)
     if (current.st_uid, current.st_gid) != (original.st_uid, original.st_gid):
         os.chown(staged, original.st_uid, original.st_gid)
     ordinary_mode = stat.S_IMODE(original.st_mode) & ~(stat.S_ISUID | stat.S_ISGID)
@@ -192,13 +197,17 @@ def _preserve_destination_metadata(source: str, staged: str, original: os.stat_r
         # Python's os xattr APIs are Linux-only; use macOS's metadata copier.
         import ctypes
         native = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
-        copyfile = native.copyfile
-        copyfile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_uint32]
+        copyfile = native.fcopyfile
+        copyfile.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
         copyfile.restype = ctypes.c_int
-        if copyfile(os.fsencode(source), os.fsencode(staged), None, 4) != 0:
-            number = ctypes.get_errno()
-            raise OSError(number, os.strerror(number))
-        _set_macos_acl(source, staged)
+        source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            if copyfile(source_fd, staged, None, 4) != 0:
+                number = ctypes.get_errno()
+                raise OSError(number, os.strerror(number))
+            _set_macos_acl(source_fd, staged)
+        finally:
+            os.close(source_fd)
     elif sys.platform.startswith("linux"):
         # Linux stores POSIX ACLs and security labels in extended attributes.
         # Unlike shutil.copystat, do not silently ignore access-control errors.
@@ -219,14 +228,30 @@ def _preserve_destination_metadata(source: str, staged: str, original: os.stat_r
     if sys.platform.startswith("linux"):
         if {name: os.getxattr(staged, name) for name in os.listxattr(staged)} != attributes:
             raise OSError("Could not preserve destination extended attributes")
-    after = os.stat(staged)
+    after = os.fstat(staged)
     if (after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode)) != (
         original.st_uid, original.st_gid, ordinary_mode
     ):
         raise OSError("Could not preserve destination ownership and mode")
 
 
-def render_to_file(serialized: str, output_path: str, fmt: str) -> dict:
+def _staging_entry_matches(path: str, descriptor: int) -> bool:
+    """The descriptor pins our inode; the name may have been replaced."""
+    try:
+        named = os.lstat(path)
+        opened = os.fstat(descriptor)
+    except OSError:
+        return False
+    return (stat.S_ISREG(named.st_mode) and opened.st_nlink == 1
+            and (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino))
+
+
+def _validate_staging_entry(path: str, descriptor: int) -> None:
+    if not _staging_entry_matches(path, descriptor):
+        raise OSError("Staging output identity changed while rendering")
+
+
+def render_to_file(serialized: str, output_path: str, fmt: str, *, overwrite: bool = True) -> dict:
     output_path = os.fspath(output_path)
     separators = tuple(separator for separator in (os.sep, os.altsep) if separator)
     if output_path.endswith(separators):
@@ -234,10 +259,12 @@ def render_to_file(serialized: str, output_path: str, fmt: str) -> dict:
     try:
         requested_path = output_path if os.path.isabs(output_path) else os.path.join(os.getcwd(), output_path)
         _validate_output_path_shape(requested_path)
-        destination_path = os.path.realpath(requested_path)
         output_links = _capture_output_links(requested_path)
+        destination_path = os.path.realpath(requested_path)
         _revalidate_output_path(requested_path, destination_path, output_links)
         original = _read_destination(destination_path)
+        if original is not None and not overwrite:
+            raise FileExistsError(f"Output already exists: {output_path}")
         if original is not None and not (sys.platform == "darwin" or sys.platform.startswith("linux")):
             raise OSError("Preserving overwrite access controls is supported only on macOS and Linux")
     except OSError as exc:
@@ -270,13 +297,14 @@ def render_to_file(serialized: str, output_path: str, fmt: str) -> dict:
         pending_fd = os.open(candidate_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, creation_mode)
         temporary_path = candidate_path  # Cleanup only a file we created successfully.
         if original is not None:
-            _make_staging_private(temporary_path)
-        output_file = os.fdopen(pending_fd, "wb")
-        pending_fd = None  # The file object now owns the descriptor.
+            _make_staging_private(pending_fd)
+        # Keep the inode pinned through metadata, publication and cleanup.
+        output_file = os.fdopen(pending_fd, "wb", closefd=False)
         with output_file as fh:
             if fh.write(data) != len(data):
                 raise OSError("Incomplete renderer output write")
-        file_size = os.path.getsize(temporary_path)
+        _validate_staging_entry(temporary_path, pending_fd)
+        file_size = os.fstat(pending_fd).st_size
         if file_size != len(data):
             raise OSError("Incomplete renderer output file")
         # Re-read once more after staging, so a known newer access-control
@@ -284,25 +312,27 @@ def render_to_file(serialized: str, output_path: str, fmt: str) -> dict:
         _revalidate_output_path(requested_path, destination_path, output_links)
         original = _refresh_destination(destination_path, original)
         if original is not None:
-            _preserve_destination_metadata(destination_path, temporary_path, original)
+            _preserve_destination_metadata(destination_path, pending_fd, original)
         current = _refresh_destination(destination_path, original)
         if current is not None and _metadata_version(current) != _metadata_version(original):
             raise OSError("Output destination metadata changed while staging")
         _revalidate_output_path(requested_path, destination_path, output_links)
+        _validate_staging_entry(temporary_path, pending_fd)
         os.replace(temporary_path, destination_path)
         temporary_path = None  # Publication releases ownership of the staging name.
     except OSError as exc:
         raise RuntimeError(f"Could not write {output_path}: {exc}") from exc
     finally:
         # Best-effort cleanup must not hide the original write error.
+        if temporary_path is not None and pending_fd is not None:
+            if _staging_entry_matches(temporary_path, pending_fd):
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
         if pending_fd is not None:
             try:
                 os.close(pending_fd)
-            except OSError:
-                pass
-        if temporary_path is not None:
-            try:
-                os.unlink(temporary_path)
             except OSError:
                 pass
     return {

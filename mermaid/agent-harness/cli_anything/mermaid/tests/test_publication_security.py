@@ -11,6 +11,13 @@ import pytest
 from cli_anything.mermaid.utils import mermaid_backend
 
 
+def _preserve_metadata_with_descriptor(source, staged, attributes):
+    # Linux xattr emulation follows the same FD-based API used in production.
+    with open(staged, "rb") as file:
+        attributes[str(file.fileno())] = attributes[str(staged)]
+        mermaid_backend._preserve_destination_metadata(str(source), file.fileno(), source.stat())
+
+
 SUPPORTED = sys.platform == "darwin" or sys.platform.startswith("linux")
 pytestmark = pytest.mark.skipif(not SUPPORTED, reason="native overwrite metadata profile")
 
@@ -176,7 +183,7 @@ def test_linux_attribute_copy_excludes_file_capabilities_but_keeps_labels(monkey
     monkeypatch.setattr(os, "getxattr", lambda path, name: attributes[str(path)][name], raising=False)
     monkeypatch.setattr(os, "setxattr", lambda path, name, value: attributes[str(path)].__setitem__(name, value), raising=False)
     monkeypatch.setattr(os, "removexattr", lambda path, name: attributes[str(path)].pop(name), raising=False)
-    mermaid_backend._preserve_destination_metadata(str(target), str(staged), target.stat())
+    _preserve_metadata_with_descriptor(target, staged, attributes)
     assert attributes[str(staged)] == {"security.selinux": b"label", "system.posix_acl_access": b"acl"}
     assert attributes[str(target)]["security.capability"] == b"source-privilege"
 
@@ -281,8 +288,11 @@ def test_target_acl_is_installed_before_stage_mode_is_widened(monkeypatch, rende
     widened = []
 
     def check_before_widening(path, mode):
-        if mode == 0o644 and ".mermaid-" in str(path):
-            observed = subprocess.check_output(["/bin/ls", "-le", str(path)], text=True).splitlines()[1:]
+        if mode == 0o644 and (isinstance(path, int) or ".mermaid-" in str(path)):
+            staged = next(tmp_path.glob(".mermaid-*"))
+            if isinstance(path, int):
+                assert os.fstat(path).st_ino == staged.stat().st_ino
+            observed = subprocess.check_output(["/bin/ls", "-le", str(staged)], text=True).splitlines()[1:]
             assert observed == expected_acl
             widened.append(True)
         return chmod(path, mode)
@@ -385,7 +395,7 @@ def test_linux_content_integrity_metadata_is_not_rebound_to_render_bytes(monkeyp
     monkeypatch.setattr(os, "getxattr", lambda path, name: attributes[str(path)][name], raising=False)
     monkeypatch.setattr(os, "setxattr", lambda path, name, value: attributes[str(path)].__setitem__(name, value), raising=False)
     monkeypatch.setattr(os, "removexattr", lambda path, name: attributes[str(path)].pop(name), raising=False)
-    mermaid_backend._preserve_destination_metadata(str(source), str(staged), source.stat())
+    _preserve_metadata_with_descriptor(source, staged, attributes)
     assert attributes[str(staged)] == ordinary
     assert attributes[str(source)] == dict(content_bound, **ordinary)
 
@@ -469,3 +479,128 @@ def test_successful_publication_releases_staging_name_ownership(monkeypatch, ren
     assert len(unrelated) == 1
     with open(unrelated[0], "rb") as fh:
         assert fh.read() == b"another writer"
+
+
+@pytest.mark.parametrize("dot", [".", ".."])
+@pytest.mark.parametrize("links", [0, 1, 2])
+def test_missing_traversal_is_rejected_without_overwriting(renderer, tmp_path, dot, links):
+    from click.testing import CliRunner
+    from cli_anything.mermaid.mermaid_cli import cli
+
+    target = tmp_path / "out.svg"
+    target.write_bytes(b"original")
+    output = str(tmp_path / "missing") + f"/{dot}/"
+    output += "../out.svg" if dot == "." else "out.svg"
+    for index in range(links):
+        link = tmp_path / f"alias-{index}.svg"
+        link.symlink_to(output)
+        output = str(link)
+    project = tmp_path / "project.json"
+    runner = CliRunner()
+    assert runner.invoke(cli, ["project", "new", "-o", str(project)]).exit_code == 0
+    calls = renderer()
+    result = runner.invoke(cli, ["--project", str(project), "export", "render", output])
+    assert result.exit_code == 1, result.output
+    assert "Error:" in result.output
+    assert not calls
+    assert target.read_bytes() == b"original"
+    assert not (tmp_path / "missing").exists()
+    assert not list(tmp_path.glob(".mermaid-*"))
+    for index in range(links):
+        assert (tmp_path / f"alias-{index}.svg").is_symlink()
+
+
+def test_cli_enforces_no_overwrite_after_initial_existence_check(monkeypatch, renderer, tmp_path):
+    from click.testing import CliRunner
+    from cli_anything.mermaid.mermaid_cli import cli
+    from cli_anything.mermaid.core import export
+
+    target = tmp_path / "out.svg"
+    project = tmp_path / "project.json"
+    runner = CliRunner()
+    assert runner.invoke(cli, ["project", "new", "-o", str(project)]).exit_code == 0
+    exists = os.path.exists
+
+    def created_after_check(path):
+        if os.fspath(path) == str(target):
+            target.write_bytes(b"another writer")
+            return False
+        return exists(path)
+
+    monkeypatch.setattr(export.os.path, "exists", created_after_check)
+    calls = renderer()
+    result = runner.invoke(cli, ["--project", str(project), "export", "render", str(target)])
+    assert result.exit_code == 1, result.output
+    assert "already exists" in result.output
+    assert not calls
+    assert target.read_bytes() == b"another writer"
+
+
+@pytest.mark.parametrize("phase", ["after_write", "metadata"])
+@pytest.mark.parametrize("replacement", ["symlink", "regular"])
+def test_staging_substitution_preserves_unrelated_file_and_destination(monkeypatch, renderer, tmp_path, phase, replacement):
+    target = tmp_path / "out.svg"
+    target.write_bytes(b"original")
+    target.chmod(0o644)
+    unrelated = tmp_path / "private.svg"
+    data = b"<svg>new render</svg>"
+    unrelated.write_bytes(b"x" * len(data))
+    unrelated.chmod(0o600)
+    original_unrelated = unrelated.stat()
+    if sys.platform == "darwin":
+        import subprocess
+        subprocess.run(["/bin/chmod", "+a", "user:nobody deny read", str(target)], check=True)
+        subprocess.run(["/bin/chmod", "+a", "user:nobody deny write", str(unrelated)], check=True)
+        subprocess.run(["/usr/bin/xattr", "-w", "com.cli-anything.stage", "source", str(target)], check=True)
+        subprocess.run(["/usr/bin/xattr", "-w", "com.cli-anything.stage", "private", str(unrelated)], check=True)
+        original_acl = subprocess.check_output(["/bin/ls", "-le", str(unrelated)], text=True).splitlines()[1:]
+    else:
+        os.setxattr(target, "user.cli-anything.stage", b"source")
+        os.setxattr(unrelated, "user.cli-anything.stage", b"private")
+    replaced = []
+
+    def substitute():
+        staged = next(tmp_path.glob(".mermaid-*"))
+        staged.unlink()
+        if replacement == "symlink":
+            staged.symlink_to(unrelated.name)
+        else:
+            staged.write_bytes(b"y" * len(data))
+        replaced.append(staged)
+
+    if phase == "after_write":
+        fdopen = os.fdopen
+        class Writer:
+            def __init__(self, file): self.file = file
+            def __enter__(self): self.file.__enter__(); return self
+            def write(self, data): return self.file.write(data)
+            def __exit__(self, *args):
+                result = self.file.__exit__(*args)
+                substitute()
+                return result
+        monkeypatch.setattr(os, "fdopen", lambda fd, *a, **k: Writer(fdopen(fd, *a, **k)))
+    else:
+        preserve = mermaid_backend._preserve_destination_metadata
+        def replace_before_metadata(*args):
+            substitute()
+            preserve(*args)
+        monkeypatch.setattr(mermaid_backend, "_preserve_destination_metadata", replace_before_metadata)
+    renderer()
+    with pytest.raises(RuntimeError, match="[Ss]taging"):
+        mermaid_backend.render_to_file("pako:x", str(target), "svg")
+    assert target.read_bytes() == b"original"
+    assert not target.is_symlink()
+    assert unrelated.read_bytes() == b"x" * len(data)
+    assert stat.S_IMODE(unrelated.stat().st_mode) == 0o600
+    assert unrelated.stat().st_ino == original_unrelated.st_ino
+    if sys.platform == "darwin":
+        assert subprocess.check_output(["/bin/ls", "-le", str(unrelated)], text=True).splitlines()[1:] == original_acl
+        assert subprocess.check_output(["/usr/bin/xattr", "-p", "com.cli-anything.stage", str(unrelated)]).strip() == b"private"
+    else:
+        assert os.getxattr(unrelated, "user.cli-anything.stage") == b"private"
+    assert len(replaced) == 1
+    if replacement == "symlink":
+        assert replaced[0].is_symlink()
+        assert os.readlink(replaced[0]) == unrelated.name
+    else:
+        assert replaced[0].read_bytes() == b"y" * len(data)

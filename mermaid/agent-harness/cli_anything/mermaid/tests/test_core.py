@@ -10,6 +10,13 @@ from cli_anything.mermaid.core.session import Session, default_state
 from cli_anything.mermaid.utils import mermaid_backend
 
 
+def _preserve_metadata_with_descriptor(source, staged, attributes):
+    # Linux xattr emulation follows the same FD-based API used in production.
+    with open(staged, "rb") as file:
+        attributes[str(file.fileno())] = attributes[str(staged)]
+        mermaid_backend._preserve_destination_metadata(str(source), file.fileno(), source.stat())
+
+
 
 def _assert_unsupported_overwrite_contract(target):
     """Existing-file cases exercise refusal on platforms outside the profile."""
@@ -237,7 +244,13 @@ def test_render_publish_failure_preserves_destination(monkeypatch, tmp_path, fai
     if _assert_unsupported_overwrite_contract(target):
         return
     if failure_mode == "size":
-        monkeypatch.setattr(os.path, "getsize", lambda path: 0)
+        fstat = os.fstat
+        def incorrect_size(fd):
+            import stat
+            values = list(fstat(fd))
+            values[stat.ST_SIZE] = 0
+            return os.stat_result(values)
+        monkeypatch.setattr(os, "fstat", incorrect_size)
     elif failure_mode == "chmod":
         def fail_chmod(path, mode):
             raise OSError("simulated chmod failure")
@@ -261,11 +274,16 @@ def test_render_cleanup_failure_preserves_write_diagnostic(monkeypatch, tmp_path
         return
     with monkeypatch.context() as patch:
         patch.setattr(mermaid_backend.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(data))
-        def fail_size(path):
-            raise OSError("original size-check failure")
+        fstat = os.fstat
+        calls = []
+        def fail_size(fd):
+            calls.append(fd)
+            if len(calls) == 2:  # After the descriptor/name identity check.
+                raise OSError("original size-check failure")
+            return fstat(fd)
         def fail_unlink(path):
             raise OSError("cleanup denied")
-        patch.setattr(os.path, "getsize", fail_size)
+        patch.setattr(os, "fstat", fail_size)
         patch.setattr(os, "unlink", fail_unlink)
         with pytest.raises(RuntimeError, match="original size-check failure") as error:
             mermaid_backend.render_to_file("pako:x", str(target), "svg")
@@ -416,11 +434,16 @@ def test_render_failed_cleanup_keeps_restrictive_temporary_mode(monkeypatch, tmp
     target.chmod(0o600)
     with monkeypatch.context() as patch:
         patch.setattr(mermaid_backend.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(b"private render"))
-        def fail_size(path):
-            raise OSError("original size failure")
+        fstat = os.fstat
+        calls = []
+        def fail_size(fd):
+            calls.append(fd)
+            if len(calls) == 2:
+                raise OSError("original size failure")
+            return fstat(fd)
         def fail_cleanup(path):
             raise OSError("cleanup denied")
-        patch.setattr(os.path, "getsize", fail_size)
+        patch.setattr(os, "fstat", fail_size)
         patch.setattr(os, "unlink", fail_cleanup)
         previous = os.umask(0o022)
         try:
@@ -480,7 +503,13 @@ def test_render_failure_preserves_output_symlink_and_target(monkeypatch, tmp_pat
     output.symlink_to("releases/v1.svg")
     monkeypatch.setattr(mermaid_backend.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(b"new render"))
     if failure_mode == "size":
-        monkeypatch.setattr(os.path, "getsize", lambda path: 0)
+        fstat = os.fstat
+        def incorrect_size(fd):
+            import stat
+            values = list(fstat(fd))
+            values[stat.ST_SIZE] = 0
+            return os.stat_result(values)
+        monkeypatch.setattr(os, "fstat", incorrect_size)
     else:
         def fail_replace(source, destination):
             raise OSError("replace denied")
@@ -649,8 +678,8 @@ def test_linux_metadata_copy_is_strict(monkeypatch, tmp_path, fail_attribute_cop
     monkeypatch.setattr(os, "setxattr", set_attribute, raising=False)
     if fail_attribute_copy:
         with pytest.raises(PermissionError, match="security label"):
-            mermaid_backend._preserve_destination_metadata(str(target), str(staged), target.stat())
+            _preserve_metadata_with_descriptor(target, staged, attributes)
     else:
-        mermaid_backend._preserve_destination_metadata(str(target), str(staged), target.stat())
+        _preserve_metadata_with_descriptor(target, staged, attributes)
         assert attributes[str(staged)] == attributes[str(target)]
     assert target.read_bytes() == b"old"
