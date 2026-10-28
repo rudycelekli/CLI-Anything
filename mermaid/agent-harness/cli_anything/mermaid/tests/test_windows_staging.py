@@ -20,7 +20,7 @@ class Function:
 def windows_handles(monkeypatch):
     if os.name == "nt":
         pytest.skip("POSIX-backed API emulation; use native Windows lifecycle controls")
-    real_open, real_close, real_dup = os.open, os.close, os.dup
+    real_open, real_close, real_dup, real_fstat = os.open, os.close, os.dup, os.fstat
     real_replace, real_unlink, real_fchmod = os.replace, os.unlink, os.fchmod
     handles, events = {}, []
     state = {"adoption_fails": False, "reopen_fails": False, "restore_fails": False, "mask": 0}
@@ -79,6 +79,17 @@ def windows_handles(monkeypatch):
             raise OSError("CRT descriptor allocation failed")
         return handles[handle]["fd"]
 
+    def fstat(fd):
+        value = real_fstat(fd)
+        try:
+            entry = handles[get_handle(fd)]
+        except StopIteration:
+            return value
+        class WithAttributes:
+            st_file_attributes = entry["inode"]["attributes"]
+            def __getattr__(self, name): return getattr(value, name)
+        return WithAttributes()
+
     def close_fd(fd):
         for entry in handles.values():
             if entry["fd"] == fd and not entry["closed"]:
@@ -117,6 +128,7 @@ def windows_handles(monkeypatch):
     monkeypatch.setattr(os, "O_NOINHERIT", 0x80, raising=False)
     monkeypatch.setattr(os, "open", crt_open)
     monkeypatch.setattr(os, "close", close_fd)
+    monkeypatch.setattr(os, "fstat", fstat)
     monkeypatch.setattr(os, "replace", replace)
     monkeypatch.setattr(os, "unlink", unlink)
     monkeypatch.setattr(mermaid_backend.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(b"<svg/>"))

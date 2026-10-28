@@ -248,7 +248,7 @@ def _validate_staging_entry(path: str, descriptor: int) -> None:
         raise OSError("Staging output identity changed while rendering")
 
 
-def _windows_set_handle_readonly(handle: int, readonly: bool) -> None:
+def _windows_set_handle_readonly(handle: int, readonly: bool, attributes: int) -> None:
     """Change only READONLY on the pinned handle, retaining other attributes."""
     import ctypes
     class BasicInfo(ctypes.Structure):
@@ -256,25 +256,21 @@ def _windows_set_handle_readonly(handle: int, readonly: bool) -> None:
                     ("LastWriteTime", ctypes.c_int64), ("ChangeTime", ctypes.c_int64),
                     ("FileAttributes", ctypes.c_uint32)]
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    get_info = kernel.GetFileInformationByHandleEx
-    get_info.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
-    get_info.restype = ctypes.c_int
     set_info = kernel.SetFileInformationByHandle
-    set_info.argtypes = get_info.argtypes
+    set_info.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
     set_info.restype = ctypes.c_int
-    current = BasicInfo()
-    if not get_info(handle, 0, ctypes.byref(current), ctypes.sizeof(current)):
-        raise ctypes.WinError()
     changed = BasicInfo()  # Zero times leave timestamps unchanged.
-    changed.FileAttributes = ((current.FileAttributes | 1) if readonly
-                              else (current.FileAttributes & ~1)) or 0x80
+    changed.FileAttributes = ((attributes | 1) if readonly else (attributes & ~1)) or 0x80
     if not set_info(handle, 0, ctypes.byref(changed), ctypes.sizeof(changed)):
         raise ctypes.WinError()
 
 
 def _windows_set_readonly(descriptor: int, readonly: bool) -> None:
     import msvcrt
-    _windows_set_handle_readonly(msvcrt.get_osfhandle(descriptor), readonly)
+    # CPython fstat obtains attributes without requiring FILE_READ_ATTRIBUTES
+    # on the CRT's write handle; FileBasicInfo queries require that extra right.
+    attributes = os.fstat(descriptor).st_file_attributes
+    _windows_set_handle_readonly(msvcrt.get_osfhandle(descriptor), readonly, attributes)
 
 
 def _open_staging_file(path: str, mode: int) -> int:
