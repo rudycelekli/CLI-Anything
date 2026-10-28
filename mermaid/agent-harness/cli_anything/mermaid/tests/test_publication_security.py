@@ -18,6 +18,34 @@ def _preserve_metadata_with_descriptor(source, staged, attributes):
         mermaid_backend._preserve_destination_metadata(str(source), file.fileno(), source.stat())
 
 
+def _macos_acl_bytes(path):
+    """Compare UUID-based ACL data without transient name-service formatting."""
+    import ctypes
+    native = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    native.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    native.acl_get_file.restype = ctypes.c_void_p
+    native.acl_size.argtypes = [ctypes.c_void_p]
+    native.acl_size.restype = ctypes.c_ssize_t
+    native.acl_copy_ext.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ssize_t]
+    native.acl_copy_ext.restype = ctypes.c_ssize_t
+    native.acl_free.argtypes = [ctypes.c_void_p]
+    native.acl_free.restype = ctypes.c_int
+    acl = native.acl_get_file(os.fsencode(path), 0x100)
+    if not acl:
+        raise OSError(ctypes.get_errno(), "Cannot read fixture ACL")
+    try:
+        size = native.acl_size(acl)
+        if size < 0:
+            raise OSError(ctypes.get_errno(), "Cannot size fixture ACL")
+        buffer = ctypes.create_string_buffer(size)
+        written = native.acl_copy_ext(buffer, acl, size)
+        if written < 0:
+            raise OSError(ctypes.get_errno(), "Cannot serialize fixture ACL")
+        return buffer.raw[:written]
+    finally:
+        native.acl_free(acl)
+
+
 SUPPORTED = sys.platform == "darwin" or sys.platform.startswith("linux")
 pytestmark = pytest.mark.skipif(not SUPPORTED, reason="native overwrite metadata profile")
 
@@ -245,8 +273,8 @@ def test_overwrite_stage_is_private_until_all_bytes_are_written(monkeypatch, ren
     target = parent / "out.svg"
     target.write_bytes(b"original")
     target.chmod(0o644)
-    original_acl = subprocess.check_output(["/bin/ls", "-le", str(target)], text=True).splitlines()[1:]
-    assert original_acl, "fixture must inherit a real extended ACL"
+    assert subprocess.check_output(["/bin/ls", "-le", str(target)], text=True).splitlines()[1:], "fixture must inherit a real extended ACL"
+    original_acl = _macos_acl_bytes(target)
     renderer()
     real_fdopen = os.fdopen
     observations = []
@@ -270,7 +298,7 @@ def test_overwrite_stage_is_private_until_all_bytes_are_written(monkeypatch, ren
     monkeypatch.setattr(os, "fdopen", lambda fd, *args, **kwargs: Writer(real_fdopen(fd, *args, **kwargs)))
     mermaid_backend.render_to_file("pako:x", str(target), "svg")
     assert observations == [(0o600, [])]
-    assert subprocess.check_output(["/bin/ls", "-le", str(target)], text=True).splitlines()[1:] == original_acl
+    assert _macos_acl_bytes(target) == original_acl
     assert target.read_bytes() == b"<svg>new render</svg>"
 
 
@@ -281,8 +309,8 @@ def test_target_acl_is_installed_before_stage_mode_is_widened(monkeypatch, rende
     target.write_bytes(b"original")
     target.chmod(0o644)
     subprocess.run(["/bin/chmod", "+a", "user:nobody deny read", str(target)], check=True)
-    expected_acl = subprocess.check_output(["/bin/ls", "-le", str(target)], text=True).splitlines()[1:]
-    assert expected_acl
+    assert subprocess.check_output(["/bin/ls", "-le", str(target)], text=True).splitlines()[1:]
+    expected_acl = _macos_acl_bytes(target)
     renderer()
     chmod = os.chmod
     widened = []
@@ -292,7 +320,7 @@ def test_target_acl_is_installed_before_stage_mode_is_widened(monkeypatch, rende
             staged = next(tmp_path.glob(".mermaid-*"))
             if isinstance(path, int):
                 assert os.fstat(path).st_ino == staged.stat().st_ino
-            observed = subprocess.check_output(["/bin/ls", "-le", str(staged)], text=True).splitlines()[1:]
+            observed = _macos_acl_bytes(staged)
             assert observed == expected_acl
             widened.append(True)
         return chmod(path, mode)
@@ -301,7 +329,7 @@ def test_target_acl_is_installed_before_stage_mode_is_widened(monkeypatch, rende
     mermaid_backend.render_to_file("pako:x", str(target), "svg")
     assert widened == [True]
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
-    assert subprocess.check_output(["/bin/ls", "-le", str(target)], text=True).splitlines()[1:] == expected_acl
+    assert _macos_acl_bytes(target) == expected_acl
 
 
 @pytest.mark.parametrize("phase", ["fetch", "staging", "metadata"])
@@ -553,7 +581,7 @@ def test_staging_substitution_preserves_unrelated_file_and_destination(monkeypat
         subprocess.run(["/bin/chmod", "+a", "user:nobody deny write", str(unrelated)], check=True)
         subprocess.run(["/usr/bin/xattr", "-w", "com.cli-anything.stage", "source", str(target)], check=True)
         subprocess.run(["/usr/bin/xattr", "-w", "com.cli-anything.stage", "private", str(unrelated)], check=True)
-        original_acl = subprocess.check_output(["/bin/ls", "-le", str(unrelated)], text=True).splitlines()[1:]
+        original_acl = _macos_acl_bytes(unrelated)
     else:
         os.setxattr(target, "user.cli-anything.stage", b"source")
         os.setxattr(unrelated, "user.cli-anything.stage", b"private")
@@ -594,7 +622,7 @@ def test_staging_substitution_preserves_unrelated_file_and_destination(monkeypat
     assert stat.S_IMODE(unrelated.stat().st_mode) == 0o600
     assert unrelated.stat().st_ino == original_unrelated.st_ino
     if sys.platform == "darwin":
-        assert subprocess.check_output(["/bin/ls", "-le", str(unrelated)], text=True).splitlines()[1:] == original_acl
+        assert _macos_acl_bytes(unrelated) == original_acl
         assert subprocess.check_output(["/usr/bin/xattr", "-p", "com.cli-anything.stage", str(unrelated)]).strip() == b"private"
     else:
         assert os.getxattr(unrelated, "user.cli-anything.stage") == b"private"
@@ -604,3 +632,72 @@ def test_staging_substitution_preserves_unrelated_file_and_destination(monkeypat
         assert os.readlink(replaced[0]) == unrelated.name
     else:
         assert replaced[0].read_bytes() == b"y" * len(data)
+
+
+@pytest.mark.parametrize("phase", ["fetch", "staging", "metadata"])
+@pytest.mark.parametrize("linked", [False, True])
+def test_removed_dot_traversal_directory_is_rechecked(monkeypatch, renderer, tmp_path, phase, linked):
+    traversed = tmp_path / "traversed"
+    traversed.mkdir()
+    target = tmp_path / "out.svg"
+    target.write_bytes(b"original")
+    output = str(traversed) + "/../out.svg"
+    if linked:
+        link = tmp_path / "current.svg"
+        link.symlink_to(output)
+        output = str(link)
+    if phase == "fetch":
+        renderer(traversed.rmdir)
+    else:
+        renderer()
+        if phase == "staging":
+            fdopen = os.fdopen
+            class Writer:
+                def __init__(self, file): self.file = file
+                def __enter__(self): self.file.__enter__(); return self
+                def __exit__(self, *args): return self.file.__exit__(*args)
+                def write(self, data):
+                    result = self.file.write(data)
+                    traversed.rmdir()
+                    return result
+            monkeypatch.setattr(os, "fdopen", lambda fd, *a, **k: Writer(fdopen(fd, *a, **k)))
+        else:
+            preserve = mermaid_backend._preserve_destination_metadata
+            def remove_after_metadata(*args):
+                preserve(*args)
+                traversed.rmdir()
+            monkeypatch.setattr(mermaid_backend, "_preserve_destination_metadata", remove_after_metadata)
+    with pytest.raises(RuntimeError, match="Requested output path changed"):
+        mermaid_backend.render_to_file("pako:x", output, "svg")
+    assert target.read_bytes() == b"original"
+    assert not os.path.exists(output)
+    assert not list(tmp_path.glob(".mermaid-*"))
+    if linked:
+        assert link.is_symlink()
+
+
+def test_hard_linked_relative_symlinks_capture_each_parent_context(renderer, tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    destination = tmp_path / "dest"
+    destination.mkdir()
+    first = tmp_path / "a"
+    first.symlink_to("sub")
+    second = sub / "b"
+    os.link(first, second, follow_symlinks=False)
+    assert first.lstat().st_ino == second.lstat().st_ino
+    inner = sub / "sub"
+    inner.symlink_to("../dest")
+    target = destination / "out.svg"
+    target.write_bytes(b"original")
+
+    def same_target_rotation():
+        inner.unlink()
+        inner.symlink_to("../dest")
+
+    renderer(same_target_rotation)
+    with pytest.raises(RuntimeError, match="Requested output path changed"):
+        mermaid_backend.render_to_file("pako:x", str(first / "b" / "out.svg"), "svg")
+    assert target.read_bytes() == b"original"
+    assert first.is_symlink() and second.is_symlink() and inner.is_symlink()
+    assert not list(destination.glob(".mermaid-*"))

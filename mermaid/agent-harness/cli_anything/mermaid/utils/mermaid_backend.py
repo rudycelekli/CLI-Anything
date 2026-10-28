@@ -91,7 +91,7 @@ def _capture_output_links(path: str) -> dict[str, tuple]:
             if cursor in references and references[cursor] != reference:
                 raise OSError("Requested output path changed while inspecting links")
             references[cursor] = reference
-            identity = (entry.st_dev, entry.st_ino)
+            identity = (entry.st_dev, entry.st_ino, os.path.realpath(os.path.dirname(cursor)))
             if identity not in expanded:
                 expanded.add(identity)
                 pending.append(target if os.path.isabs(target) else os.path.join(os.path.dirname(cursor), target))
@@ -100,17 +100,14 @@ def _capture_output_links(path: str) -> dict[str, tuple]:
 
 def _revalidate_output_path(path: str, destination: str, links: dict[str, tuple]) -> None:
     """Refuse known link rotations; the final check/rename is not atomic CAS."""
-    if os.path.realpath(path) != destination:
+    try:
+        # Repeat traversal validation before realpath can hide a directory
+        # removed during the renderer wait or staging/metadata work.
+        current_links = _capture_output_links(path)
+    except OSError as exc:
+        raise OSError("Requested output path changed while rendering") from exc
+    if current_links != links or os.path.realpath(path) != destination:
         raise OSError("Requested output path changed while rendering")
-    for entry_path, expected in links.items():
-        try:
-            entry = os.lstat(entry_path)
-            current = (entry.st_dev, entry.st_ino, entry.st_ctime_ns,
-                       os.readlink(entry_path) if stat.S_ISLNK(entry.st_mode) else None)
-        except OSError as exc:
-            raise OSError("Requested output path changed while rendering") from exc
-        if current != expected:
-            raise OSError("Requested output path changed while rendering")
 
 
 def _read_destination(path: str) -> os.stat_result | None:
@@ -251,6 +248,43 @@ def _validate_staging_entry(path: str, descriptor: int) -> None:
         raise OSError("Staging output identity changed while rendering")
 
 
+def _open_staging_file(path: str, mode: int) -> int:
+    if sys.platform != "win32":
+        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+
+    # CRT os.open does not share deletion; a pinned handle then blocks rename
+    # and cleanup. Keep exclusive creation with a non-inheritable Win32 handle
+    # that shares DELETE access, and transfer ownership to the CRT descriptor.
+    import ctypes
+    import msvcrt
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
+                       ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+    create.restype = ctypes.c_void_p
+    close = kernel.CloseHandle
+    close.argtypes = [ctypes.c_void_p]
+    close.restype = ctypes.c_int
+    dispose = kernel.SetFileInformationByHandle
+    dispose.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    dispose.restype = ctypes.c_int
+    # GENERIC_WRITE | DELETE, FILE_SHARE_DELETE, CREATE_NEW, FILE_ATTRIBUTE_NORMAL.
+    handle = create(path, 0x40010000, 4, None, 1, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError()
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY | os.O_NOINHERIT)
+    except BaseException:
+        # The CRT did not adopt the handle. Mark only this owned inode for
+        # deletion, avoiding pathname cleanup of a substituted entry.
+        delete = ctypes.c_ubyte(1)  # FILE_DISPOSITION_INFO contains a BOOLEAN.
+        try:
+            dispose(handle, 4, ctypes.byref(delete), ctypes.sizeof(delete))
+        finally:
+            close(handle)
+        raise
+
+
 def render_to_file(serialized: str, output_path: str, fmt: str, *, overwrite: bool = True) -> dict:
     output_path = os.fspath(output_path)
     separators = tuple(separator for separator in (os.sep, os.altsep) if separator)
@@ -294,7 +328,7 @@ def render_to_file(serialized: str, output_path: str, fmt: str, *, overwrite: bo
             os.makedirs(parent, exist_ok=True)
         candidate_path = os.path.join(parent, f".mermaid-{secrets.token_hex(16)}")
         creation_mode = 0o600 if original is not None else 0o666
-        pending_fd = os.open(candidate_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, creation_mode)
+        pending_fd = _open_staging_file(candidate_path, creation_mode)
         temporary_path = candidate_path  # Cleanup only a file we created successfully.
         if original is not None:
             _make_staging_private(pending_fd)
