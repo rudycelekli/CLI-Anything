@@ -248,40 +248,92 @@ def _validate_staging_entry(path: str, descriptor: int) -> None:
         raise OSError("Staging output identity changed while rendering")
 
 
+def _windows_set_handle_readonly(handle: int, readonly: bool) -> None:
+    """Change only READONLY on the pinned handle, retaining other attributes."""
+    import ctypes
+    class BasicInfo(ctypes.Structure):
+        _fields_ = [("CreationTime", ctypes.c_int64), ("LastAccessTime", ctypes.c_int64),
+                    ("LastWriteTime", ctypes.c_int64), ("ChangeTime", ctypes.c_int64),
+                    ("FileAttributes", ctypes.c_uint32)]
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_info = kernel.GetFileInformationByHandleEx
+    get_info.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    get_info.restype = ctypes.c_int
+    set_info = kernel.SetFileInformationByHandle
+    set_info.argtypes = get_info.argtypes
+    set_info.restype = ctypes.c_int
+    current = BasicInfo()
+    if not get_info(handle, 0, ctypes.byref(current), ctypes.sizeof(current)):
+        raise ctypes.WinError()
+    changed = BasicInfo()  # Zero times leave timestamps unchanged.
+    changed.FileAttributes = ((current.FileAttributes | 1) if readonly
+                              else (current.FileAttributes & ~1)) or 0x80
+    if not set_info(handle, 0, ctypes.byref(changed), ctypes.sizeof(changed)):
+        raise ctypes.WinError()
+
+
+def _windows_set_readonly(descriptor: int, readonly: bool) -> None:
+    import msvcrt
+    _windows_set_handle_readonly(msvcrt.get_osfhandle(descriptor), readonly)
+
+
 def _open_staging_file(path: str, mode: int) -> int:
     if sys.platform != "win32":
         return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
 
-    # CRT os.open does not share deletion; a pinned handle then blocks rename
-    # and cleanup. Keep exclusive creation with a non-inheritable Win32 handle
-    # that shares DELETE access, and transfer ownership to the CRT descriptor.
+    # Let the CRT apply its own current umask, without reading/changing the
+    # process-global mask. ReOpenFile changes sharing on this same pinned inode.
     import ctypes
     import msvcrt
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    create = kernel.CreateFileW
-    create.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32,
-                       ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
-    create.restype = ctypes.c_void_p
+    reopen = kernel.ReOpenFile
+    reopen.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
+    reopen.restype = ctypes.c_void_p
     close = kernel.CloseHandle
     close.argtypes = [ctypes.c_void_p]
     close.restype = ctypes.c_int
-    dispose = kernel.SetFileInformationByHandle
-    dispose.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
-    dispose.restype = ctypes.c_int
-    # GENERIC_WRITE | DELETE, FILE_SHARE_DELETE, CREATE_NEW, FILE_ATTRIBUTE_NORMAL.
-    handle = create(path, 0x40010000, 4, None, 1, 0x80, None)
-    if handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError()
+    initial_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    original = os.fstat(initial_fd)
+    readonly = not bool(original.st_mode & stat.S_IWRITE)
+    handle = None
+    adopted_fd = None
     try:
-        return msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY | os.O_NOINHERIT)
+        if readonly:
+            _windows_set_readonly(initial_fd, False)
+        # Do not request DELETE while the initial CRT handle still denies it.
+        # READ/WRITE sharing must coexist with that original handle's access.
+        handle = reopen(msvcrt.get_osfhandle(initial_fd), 0x40000000, 7, 0)
+        if handle == ctypes.c_void_p(-1).value:
+            handle = None
+            raise ctypes.WinError()
+        adopted_fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY | os.O_NOINHERIT)
+        handle = None  # The new CRT descriptor now owns it.
+        os.close(initial_fd)
+        initial_fd = None
+        if readonly:
+            _windows_set_readonly(adopted_fd, True)
+        return adopted_fd
     except BaseException:
-        # The CRT did not adopt the handle. Mark only this owned inode for
-        # deletion, avoiding pathname cleanup of a substituted entry.
-        delete = ctypes.c_ubyte(1)  # FILE_DISPOSITION_INFO contains a BOOLEAN.
+        # Reopening/adoption/restoration failed before the caller owned the
+        # stage. Close the original delete-denying descriptor first; compare
+        # inode identity before best-effort named cleanup. A reopened handle,
+        # when present, still pins that inode until cleanup has finished.
+        if initial_fd is not None:
+            os.close(initial_fd)
         try:
-            dispose(handle, 4, ctypes.byref(delete), ctypes.sizeof(delete))
+            if adopted_fd is not None:
+                _windows_set_readonly(adopted_fd, False)
+            named = os.lstat(path)
+            if (stat.S_ISREG(named.st_mode)
+                    and (named.st_dev, named.st_ino) == (original.st_dev, original.st_ino)):
+                os.unlink(path)
+        except OSError:
+            pass
         finally:
-            close(handle)
+            if adopted_fd is not None:
+                os.close(adopted_fd)
+            elif handle is not None:
+                close(handle)
         raise
 
 
@@ -361,6 +413,8 @@ def render_to_file(serialized: str, output_path: str, fmt: str, *, overwrite: bo
         if temporary_path is not None and pending_fd is not None:
             if _staging_entry_matches(temporary_path, pending_fd):
                 try:
+                    if sys.platform == "win32":
+                        _windows_set_readonly(pending_fd, False)
                     os.unlink(temporary_path)
                 except OSError:
                     pass

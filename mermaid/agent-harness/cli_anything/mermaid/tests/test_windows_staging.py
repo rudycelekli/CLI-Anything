@@ -2,6 +2,7 @@
 import ctypes
 import io
 import os
+import stat
 import sys
 import types
 
@@ -18,43 +19,59 @@ class Function:
 @pytest.fixture
 def windows_handles(monkeypatch):
     if os.name == "nt":
-        pytest.skip("POSIX-backed API emulation; use the native Windows lifecycle controls")
-    real_open, real_close = os.open, os.close
-    real_replace, real_unlink = os.replace, os.unlink
-    handles = {}
-    events = []
-    state = {"adoption_fails": False}
+        pytest.skip("POSIX-backed API emulation; use native Windows lifecycle controls")
+    real_open, real_close, real_dup = os.open, os.close, os.dup
+    real_replace, real_unlink, real_fchmod = os.replace, os.unlink, os.fchmod
+    handles, events = {}, []
+    state = {"adoption_fails": False, "reopen_fails": False, "restore_fails": False, "mask": 0}
 
-    def register(path, share):
-        fd = real_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-        handle = (1 << 40) + fd  # Verify that the wrapper accepts 64-bit handles.
-        handles[handle] = {"fd": fd, "path": path, "share": share, "closed": False, "delete": False}
+    def register(fd, inode, share):
+        handle = (1 << 40) + len(handles)
+        handles[handle] = {"fd": fd, "inode": inode, "share": share, "closed": False}
         return handle
 
-    def create(path, access, share, security, disposition, attributes, template):
-        events.append(("create", access, share, security, disposition, attributes, template))
-        try:
-            return register(path, share)
-        except OSError:
-            return ctypes.c_void_p(-1).value
+    def crt_open(path, flags, mode=0o777, **kwargs):
+        fd = real_open(path, flags, mode, **kwargs)
+        if ".mermaid-" in os.fspath(path):
+            readonly = not bool(mode & ~state["mask"] & stat.S_IWRITE)
+            real_fchmod(fd, 0o444 if readonly else 0o666)
+            inode = {"path": path, "attributes": 0x20 | int(readonly)}
+            register(fd, inode, 0)
+            events.append(("crt_create", mode, state["mask"]))
+        return fd
 
-    def disposition(handle, kind, value, size):
-        assert kind == 4 and size == 1
-        assert ctypes.cast(value, ctypes.POINTER(ctypes.c_ubyte)).contents.value == 1
-        handles[handle]["delete"] = True
-        events.append(("delete_owned_handle", handle))
+    def get_handle(fd):
+        return next(h for h, entry in handles.items() if entry["fd"] == fd and not entry["closed"])
+
+    def reopen(original, access, share, flags):
+        old = handles[original]
+        events.append(("reopen", original, access, share, flags))
+        assert access == 0x40000000 and share == 7 and flags == 0
+        if state["reopen_fails"] or old["inode"]["attributes"] & 1:
+            return ctypes.c_void_p(-1).value
+        return register(real_dup(old["fd"]), old["inode"], share)
+
+    def get_info(handle, kind, value, size):
+        assert kind == 0 and size == 40
+        value._obj.FileAttributes = handles[handle]["inode"]["attributes"]
         return 1
 
-    def close(handle):
+    def set_info(handle, kind, value, size):
+        assert kind == 0 and size == 40
+        attrs = value._obj.FileAttributes
+        events.append(("attributes", handle, attrs))
+        if state["restore_fails"] and attrs & 1:
+            return 0
         entry = handles[handle]
-        if entry["delete"]:
-            real_unlink(entry["path"])
+        entry["inode"]["attributes"] = attrs
+        real_fchmod(entry["fd"], 0o444 if attrs & 1 else 0o666)
+        return 1
+
+    def close_handle(handle):
+        entry = handles[handle]
         real_close(entry["fd"])
         entry["closed"] = True
         return 1
-
-    kernel = types.SimpleNamespace(CreateFileW=Function(create), CloseHandle=Function(close),
-                                  SetFileInformationByHandle=Function(disposition))
 
     def adopt(handle, flags):
         events.append(("adopt", handle, flags))
@@ -62,35 +79,40 @@ def windows_handles(monkeypatch):
             raise OSError("CRT descriptor allocation failed")
         return handles[handle]["fd"]
 
-    def crt_open(path, flags, mode=0o777, **kwargs):
-        if ".mermaid-" in os.fspath(path):
-            handle = register(path, 0)  # Ordinary CRT opens do not share deletion.
-            return handles[handle]["fd"]
-        return real_open(path, flags, mode, **kwargs)
-
-    def deny_unshared_delete(path):
-        for entry in handles.values():
-            if not entry["closed"] and entry["path"] == path and not entry["share"] & 4:
-                raise PermissionError("Windows sharing violation")
-
-    def replace(source, destination):
-        deny_unshared_delete(source)
-        return real_replace(source, destination)
-
-    def unlink(path, *args, **kwargs):
-        deny_unshared_delete(path)
-        return real_unlink(path, *args, **kwargs)
-
     def close_fd(fd):
         for entry in handles.values():
             if entry["fd"] == fd and not entry["closed"]:
                 entry["closed"] = True
         return real_close(fd)
 
+    def check_delete(path, deleting=False):
+        for entry in handles.values():
+            if not entry["closed"] and entry["inode"]["path"] == path:
+                if not entry["share"] & 4:
+                    raise PermissionError("Windows sharing violation")
+                if deleting and entry["inode"]["attributes"] & 1:
+                    raise PermissionError("Windows readonly deletion denied")
+
+    def replace(source, destination):
+        check_delete(source)
+        return real_replace(source, destination)
+
+    def unlink(path, *args, **kwargs):
+        check_delete(path, deleting=True)
+        return real_unlink(path, *args, **kwargs)
+
+    def legacy_create(path, access, share, security, disposition, attributes, template):
+        # Failure-before adapter: CreateFileW does not apply CRT mode/umask.
+        fd = real_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        return register(fd, {"path": path, "attributes": attributes}, share)
+
+    kernel = types.SimpleNamespace(CreateFileW=Function(legacy_create), ReOpenFile=Function(reopen), CloseHandle=Function(close_handle),
+                                  GetFileInformationByHandleEx=Function(get_info),
+                                  SetFileInformationByHandle=Function(set_info))
     monkeypatch.setattr(mermaid_backend.sys, "platform", "win32")
     monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **k: kernel, raising=False)
-    monkeypatch.setattr(ctypes, "WinError", lambda: OSError("CreateFileW failed"), raising=False)
-    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(open_osfhandle=adopt))
+    monkeypatch.setattr(ctypes, "WinError", lambda: OSError("Win32 operation failed"), raising=False)
+    monkeypatch.setitem(sys.modules, "msvcrt", types.SimpleNamespace(open_osfhandle=adopt, get_osfhandle=get_handle))
     monkeypatch.setattr(os, "O_BINARY", 0x8000, raising=False)
     monkeypatch.setattr(os, "O_NOINHERIT", 0x80, raising=False)
     monkeypatch.setattr(os, "open", crt_open)
@@ -101,9 +123,11 @@ def windows_handles(monkeypatch):
     return handles, events, state
 
 
+@pytest.mark.parametrize("mask", [0, 0o200])
 @pytest.mark.parametrize("failure", [None, "write", "publish"])
-def test_windows_new_output_publishes_or_cleans_while_pinned(windows_handles, monkeypatch, tmp_path, failure):
-    handles, events, _ = windows_handles
+def test_windows_crt_umask_preserved_through_publication(windows_handles, monkeypatch, tmp_path, mask, failure):
+    handles, events, state = windows_handles
+    state["mask"] = mask
     output = tmp_path / "out.svg"
     if failure == "write":
         fdopen = os.fdopen
@@ -123,36 +147,65 @@ def test_windows_new_output_publishes_or_cleans_while_pinned(windows_handles, mo
     else:
         mermaid_backend.render_to_file("pako:x", str(output), "svg")
         assert output.read_bytes() == b"<svg/>"
+        assert bool(output.stat().st_mode & stat.S_IWRITE) is (mask == 0)
     assert not list(tmp_path.glob(".mermaid-*"))
     assert all(entry["closed"] for entry in handles.values())
-    assert events[0] == ("create", 0x40010000, 4, None, 1, 0x80, None)
-    assert events[1][0] == "adopt"
+    assert events[0] == ("crt_create", 0o666, mask)
+    assert any(event[0] == "reopen" for event in events)
 
 
-def test_windows_descriptor_adoption_failure_deletes_owned_handle(windows_handles, tmp_path):
-    handles, events, state = windows_handles
-    state["adoption_fails"] = True
-    with pytest.raises(OSError, match="CRT descriptor allocation failed"):
+@pytest.mark.parametrize("mode", [0o444, 0o666])
+def test_windows_explicit_creation_mode_preserved(windows_handles, tmp_path, mode):
+    handles, _, _ = windows_handles
+    path = tmp_path / ".mermaid-stage"
+    fd = mermaid_backend._open_staging_file(str(path), mode)
+    try:
+        assert bool(os.fstat(fd).st_mode & stat.S_IWRITE) is bool(mode & stat.S_IWRITE)
+        mermaid_backend._windows_set_readonly(fd, False)
+        os.unlink(str(path))
+    finally:
+        os.close(fd)
+    assert all(entry["closed"] for entry in handles.values())
+
+
+@pytest.mark.parametrize("mode,mask", [(0o444, 0), (0o666, 0o200)])
+def test_windows_readonly_contract_independent_of_factory_strategy(windows_handles, tmp_path, mode, mask):
+    _, _, state = windows_handles
+    state["mask"] = mask
+    path = tmp_path / ".mermaid-stage"
+    fd = mermaid_backend._open_staging_file(str(path), mode)
+    try:
+        assert not os.fstat(fd).st_mode & stat.S_IWRITE
+    finally:
+        os.close(fd)
+        path.unlink()
+
+
+@pytest.mark.parametrize("failure", ["reopen_fails", "adoption_fails", "restore_fails"])
+def test_windows_handle_transition_failure_preserves_ownership(windows_handles, tmp_path, failure):
+    handles, _, state = windows_handles
+    state["mask"] = 0o200
+    state[failure] = True
+    with pytest.raises(OSError, match="failed"):
         mermaid_backend._open_staging_file(str(tmp_path / ".mermaid-stage"), 0o666)
     assert not list(tmp_path.iterdir())
     assert all(entry["closed"] for entry in handles.values())
-    assert any(event[0] == "delete_owned_handle" for event in events)
 
 
 def test_windows_exclusive_creation_preserves_collision(windows_handles, tmp_path):
     handles, events, _ = windows_handles
     collision = tmp_path / ".mermaid-stage"
     collision.write_bytes(b"another writer")
-    with pytest.raises(OSError, match="CreateFileW failed"):
+    with pytest.raises(FileExistsError):
         mermaid_backend._open_staging_file(str(collision), 0o666)
     assert collision.read_bytes() == b"another writer"
-    assert not handles
-    assert [event[0] for event in events] == ["create"]
+    assert not handles and not events
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="requires native Win32 sharing and deletion semantics")
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Win32 sharing, CRT mask and deletion semantics")
+@pytest.mark.parametrize("mask", [0, 0o200])
 @pytest.mark.parametrize("failure", [None, "write", "publish"])
-def test_native_windows_new_output_handle_lifecycle(monkeypatch, tmp_path, failure):
+def test_native_windows_new_output_handle_lifecycle(monkeypatch, tmp_path, mask, failure):
     monkeypatch.setattr(mermaid_backend.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(b"<svg/>"))
     output = tmp_path / "out.svg"
     descriptors = []
@@ -160,23 +213,27 @@ def test_native_windows_new_output_handle_lifecycle(monkeypatch, tmp_path, failu
 
     def observe_descriptor(fd, *args, **kwargs):
         descriptors.append(fd)
-        if failure == "write":
-            raise OSError("injected write setup failure")
+        if failure == "write": raise OSError("injected write setup failure")
         return fdopen(fd, *args, **kwargs)
 
     monkeypatch.setattr(os, "fdopen", observe_descriptor)
     if failure == "publish":
         def fail_publish(*args): raise OSError("injected publication failure")
         monkeypatch.setattr(os, "replace", fail_publish)
-    if failure:
-        with pytest.raises(RuntimeError, match="injected"):
+    previous = os.umask(mask)
+    try:
+        if failure:
+            with pytest.raises(RuntimeError, match="injected"):
+                mermaid_backend.render_to_file("pako:x", str(output), "svg")
+            assert not output.exists()
+        else:
             mermaid_backend.render_to_file("pako:x", str(output), "svg")
-        assert not output.exists()
-    else:
-        mermaid_backend.render_to_file("pako:x", str(output), "svg")
-        assert output.read_bytes() == b"<svg/>"
-    assert descriptors
-    assert not list(tmp_path.glob(".mermaid-*"))
-    for fd in descriptors:
-        with pytest.raises(OSError):
-            os.fstat(fd)
+            assert output.read_bytes() == b"<svg/>"
+            assert bool(output.stat().st_mode & stat.S_IWRITE) is (mask == 0)
+        assert descriptors
+        assert not list(tmp_path.glob(".mermaid-*"))
+        for fd in descriptors:
+            with pytest.raises(OSError): os.fstat(fd)
+    finally:
+        os.umask(previous)
+        if output.exists(): os.chmod(output, 0o666)
